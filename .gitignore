@@ -6,6 +6,9 @@ __pycache__/
 #mlruns
 */mlruns
 
+#mlflow.db
+*.db
+
 # C extensions
 *.so
 *.sh
