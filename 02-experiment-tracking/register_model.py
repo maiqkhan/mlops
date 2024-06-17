@@ -2,7 +2,7 @@ import os
 import pickle
 import click
 import mlflow
-
+import numpy as np
 from mlflow.entities import ViewType
 from mlflow.tracking import MlflowClient
 from sklearn.ensemble import RandomForestRegressor
@@ -22,8 +22,27 @@ def load_pickle(filename):
         return pickle.load(f_in)
 
 
+def train_and_log_model(data_path, params):
+    X_train, y_train = load_pickle(os.path.join(data_path, "train.pkl"))
+    X_val, y_val = load_pickle(os.path.join(data_path, "val.pkl"))
+    X_test, y_test = load_pickle(os.path.join(data_path, "test.pkl"))
+    
+    with mlflow.start_run():
+        new_params = {}
+        for param in RF_PARAMS:
+            new_params[param] = int(params[param])
 
-
+        rf = RandomForestRegressor(**new_params)
+        rf.fit(X_train, y_train)
+        print('testing')
+        # Evaluate model on the validation and test sets
+        y_pred_val = rf.predict(X_val)
+        val_rmse = np.sqrt(mean_squared_error(y_val, y_pred_val))
+        mlflow.log_metric("val_rmse", val_rmse)
+        y_pred_test = rf.predict(X_test)
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
+        mlflow.log_metric("test_rmse", test_rmse)
+        
 
 @click.command()
 @click.option(
@@ -38,27 +57,6 @@ def load_pickle(filename):
     help="Number of top models that need to be evaluated to decide which one to promote"
 )
 
-def train_and_log_model(data_path, params={}):
-    X_train, y_train = load_pickle(os.path.join(data_path, "train.pkl"))
-    X_val, y_val = load_pickle(os.path.join(data_path, "val.pkl"))
-    X_test, y_test = load_pickle(os.path.join(data_path, "test.pkl"))
-
-    with mlflow.start_run():
-        new_params = {}
-        for param in RF_PARAMS:
-            new_params[param] = int(params[param])
-
-        rf = RandomForestRegressor(**new_params)
-        rf.fit(X_train, y_train)
-
-        # Evaluate model on the validation and test sets
-        val_rmse = mean_squared_error(y_val, rf.predict(X_val), squared=False)
-        mlflow.log_metric("val_rmse", val_rmse)
-        test_rmse = mean_squared_error(y_test, rf.predict(X_test), squared=False)
-        mlflow.log_metric("test_rmse", test_rmse)
-
-
-
 def run_register_model(data_path: str, top_n: int):
 
     client = MlflowClient()
@@ -71,8 +69,8 @@ def run_register_model(data_path: str, top_n: int):
         max_results=top_n,
         order_by=["metrics.rmse ASC"]
     )
+    print(runs)
     for run in runs:
-        print(run.data.params)
         train_and_log_model(data_path=data_path, params=run.data.params)
 
     # Select the model with the lowest test RMSE
@@ -81,10 +79,10 @@ def run_register_model(data_path: str, top_n: int):
 
     #Register the best model
     run_id = best_run.info.run_id
+    print(run_id)
     model_uri = f"runs:/{run_id}/model"
     mlflow.register_model(model_uri=model_uri,name='nyc-taxi-hypopt')
 
 
 if __name__ == '__main__':
-    train_and_log_model()
     run_register_model()
