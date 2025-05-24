@@ -1,0 +1,4 @@
+load_from:
+  - python_module: 
+        module_name: nyc_taxi_trips.definitions
+        working_directory: nyc_taxi_trips
