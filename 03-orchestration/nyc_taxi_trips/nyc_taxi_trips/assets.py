@@ -2,6 +2,7 @@ import requests
 from dagster import asset, AssetExecutionContext  # import the `dagster` library
 from .resources import ExtractFileName
 
+import joblib
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
@@ -140,3 +141,8 @@ def register_lin_reg_model(
             artifact_path="model",
             registered_model_name="nyc_taxi_trip_duration_model",
         )
+
+    with open("lin_reg.joblib", "wb") as f:
+        joblib.dump(taxi_trip_lin_reg_model, f)
+
+    context.log.info("Model registered successfully in MLflow.")
