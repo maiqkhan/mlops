@@ -1,42 +1,34 @@
-import pickle 
+from fastapi import FastAPI
+import joblib
+import pandas as pd
+import json
+import uvicorn
 
-from flask import Flask, request, jsonify
+with open("lin_reg.joblib", "rb") as f_in:
+    lin_reg_pipeline = joblib.load(f_in)
 
-with open('lin_reg.bin', 'rb') as f_in:
-    (dv, model) =  pickle.load(f_in)
 
-def prepare_features(ride):
-    features = {}
+def predict_ride_duration(features) -> float:
 
-    features['PU_DO'] = '%s_%s' % (ride['PULocationID'], ride['DOLocationID'])
+    return lin_reg_pipeline.predict(features)[0]
 
-    features['trip_distance'] = ride['trip_distance']
 
-    return features
+app = FastAPI(title="NYC Taxi Trip Duration Prediction API", version="1.0")
 
-def predict(features):
-    X = dv.transform(features)
 
-    preds = model.predict(X)
+@app.post("/predict")
+def output_ride_duration(ride: dict):
 
-    return preds[0]
+    ride_df = pd.DataFrame([ride])
 
-app = Flask('duration-prediction')
+    ride_duration = predict_ride_duration(ride_df)
 
-@app.route('/predict', methods=['POST'])
-def predict_endpoint():
-    ride = request.get_json()
-    features = prepare_features(ride) 
-    pred = predict(features)   
-
-    
     result = {
-        "duration": pred
+        "duration": float(ride_duration),
     }
 
-    print(result)
-    return jsonify(result)
+    return result
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=9696)
+    uvicorn.run(app, host="0.0.0.0", port=9696)
