@@ -1,8 +1,9 @@
 import requests
 from dagster import asset, AssetExecutionContext  # import the `dagster` library
-from .resources import ExtractFileName
+from .resources import scoring_dataset_config, ExtractFileName
 
 import joblib
+import uuid
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
@@ -13,7 +14,7 @@ from sklearn.compose import ColumnTransformer
 import mlflow
 
 
-@asset(name="raw_taxi_trip_data")
+@asset(name="raw_taxi_trip_data", group_name="CREATE_MODEL")
 def raw_data(context: AssetExecutionContext, config: ExtractFileName) -> pd.DataFrame:
     """
     Getting an individaul month's taxi trip data from configured directory
@@ -26,7 +27,7 @@ def raw_data(context: AssetExecutionContext, config: ExtractFileName) -> pd.Data
     return df
 
 
-@asset(name="cleansed_taxi_trip_data")
+@asset(name="cleansed_taxi_trip_data", group_name="CREATE_MODEL")
 def cleansed_data(
     context: AssetExecutionContext, raw_taxi_trip_data: pd.DataFrame
 ) -> pd.DataFrame:
@@ -70,15 +71,13 @@ def cleansed_data(
     return clean_data
 
 
-@asset(name="taxi_trip_lin_reg_model")
+@asset(name="taxi_trip_lin_reg_model", group_name="CREATE_MODEL")
 def train_lin_reg_model(
     context: AssetExecutionContext, cleansed_taxi_trip_data: pd.DataFrame
 ) -> Pipeline:
     """
     Train a linear regression model on the cleansed taxi trip data
     """
-
-    enc = OneHotEncoder(drop="first", handle_unknown="ignore")
 
     pipeline = Pipeline(
         [
@@ -127,7 +126,7 @@ def train_lin_reg_model(
     return pipeline
 
 
-@asset(name="taxi_trip_registered_model")
+@asset(name="taxi_trip_registered_model", group_name="CREATE_MODEL")
 def register_lin_reg_model(
     context: AssetExecutionContext, taxi_trip_lin_reg_model: Pipeline
 ) -> None:
@@ -137,12 +136,128 @@ def register_lin_reg_model(
 
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=train_lin_reg_model,
+            sk_model=taxi_trip_lin_reg_model,
             artifact_path="model",
             registered_model_name="nyc_taxi_trip_duration_model",
         )
 
-    with open("lin_reg.joblib", "wb") as f:
-        joblib.dump(taxi_trip_lin_reg_model, f)
+    # with open("lin_reg.joblib", "wb") as f:
+    #     joblib.dump(taxi_trip_lin_reg_model, f)
 
     context.log.info("Model registered successfully in MLflow.")
+
+
+@asset(name="taxi_trip_input_scoring_data", group_name="SCORE_MODEL")
+def raw_taxi_trip_input_data(
+    context: AssetExecutionContext, scoring_dataset: scoring_dataset_config
+) -> pd.DataFrame:
+
+    df = pd.read_parquet(
+        f"https://d37ci6vzurychx.cloudfront.net/trip-data/{scoring_dataset.input_taxi_type}_tripdata_{scoring_dataset.input_dataset_year:04d}-{scoring_dataset.input_dataset_month:02d}.parquet"
+    )
+
+    context.log.info(f"Dataframe shape: {df.shape}")
+
+    return df
+
+
+@asset(name="cleansed_taxi_trip_scoring_data", group_name="SCORE_MODEL")
+def cleansed_scoring_data(
+    context: AssetExecutionContext, taxi_trip_input_scoring_data: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Cleans the taxi trip data
+    """
+
+    raw_data = taxi_trip_input_scoring_data.copy()
+
+    context.log.info(f"Raw data shape: {raw_data.columns}")
+    # Convert pickup and dropoff datetime columns to datetime
+    raw_data["tpep_dropoff_datetime"] = pd.to_datetime(
+        raw_data["tpep_dropoff_datetime"]
+    )
+    raw_data["tpep_pickup_datetime"] = pd.to_datetime(raw_data["tpep_pickup_datetime"])
+
+    # Calculate trip duration
+    raw_data["duration"] = (
+        raw_data["tpep_dropoff_datetime"] - raw_data["tpep_pickup_datetime"]
+    )
+    raw_data["duration"] = raw_data["duration"].dt.total_seconds() / 60
+
+    context.log.info(
+        f"Dataframe shape before duration within hour filter: {raw_data.shape}"
+    )
+
+    # Filter out durations less than 1 minute and greater than 60 minutes
+    clean_data = raw_data.query("duration >= 1 and duration <= 60")
+
+    context.log.info(
+        f"Dataframe shape after duration within hour filter: {clean_data.shape}"  # 3_316_216
+    )
+
+    # Convert LocationID to string for OneHotEncoding later on
+    categorical_cols = ["PULocationID", "DOLocationID"]
+    for col in categorical_cols:
+        clean_data[col] = clean_data[col].astype(str)
+
+    return clean_data
+
+
+@asset(name="scoring_model", group_name="SCORE_MODEL")
+def get_production_model(
+    context: AssetExecutionContext, scoring_dataset: scoring_dataset_config
+) -> Pipeline:
+    model = mlflow.sklearn.load_model(model_uri=scoring_dataset.model_uri)
+
+    context.log.info(type(model))
+
+    return model
+
+
+@asset(name="scoring_dataset", group_name="SCORE_MODEL")
+def generate_scoring_dataset(
+    context: AssetExecutionContext,
+    scoring_model: Pipeline,
+    cleansed_taxi_trip_scoring_data: pd.DataFrame,
+    scoring_dataset: scoring_dataset_config,
+) -> None:
+
+    X = cleansed_taxi_trip_scoring_data[
+        ["PULocationID", "DOLocationID", "trip_distance"]
+    ]
+
+    y_pred = scoring_model.predict(X)
+
+    scoring_df = pd.DataFrame()
+
+    if (
+        cleansed_taxi_trip_scoring_data.drop_duplicates(
+            subset=["PULocationID", "DOLocationID", "tpep_pickup_datetime"]
+        ).shape[0]
+        != cleansed_taxi_trip_scoring_data.shape[0]
+    ):
+        scoring_df["ride_id"] = scoring_df.apply(
+            lambda x: f"{uuid.uuid4()}",
+            axis=1,
+        )
+    else:
+        scoring_df["ride_id"] = cleansed_taxi_trip_scoring_data.apply(
+            lambda x: f"{x['PULocationID']}_{x['DOLocationID']}_{x['tpep_pickup_datetime']}",
+            axis=1,
+        )
+
+    scoring_df["tpep_pickup_datetime"] = cleansed_taxi_trip_scoring_data[
+        "tpep_pickup_datetime"
+    ]
+    scoring_df["PULocationID"] = cleansed_taxi_trip_scoring_data["PULocationID"]
+    scoring_df["DOLocationID"] = cleansed_taxi_trip_scoring_data["DOLocationID"]
+    scoring_df["actual_duration"] = cleansed_taxi_trip_scoring_data["duration"]
+    scoring_df["predicted_duration"] = y_pred
+    scoring_df["diff"] = (
+        scoring_df["actual_duration"] - scoring_df["predicted_duration"]
+    )
+    scoring_df["model_uri"] = scoring_dataset.model_uri
+
+    aws_bucket_path = f"s3://{scoring_dataset.output_bucket_name}/taxi_type={scoring_dataset.input_taxi_type}/year={scoring_dataset.input_dataset_year:04d}/month={scoring_dataset.input_dataset_month:02d}/{scoring_dataset.model_name}.parquet"
+
+    scoring_df.to_parquet(aws_bucket_path, index=False)
